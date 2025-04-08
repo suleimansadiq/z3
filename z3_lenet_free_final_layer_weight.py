@@ -9,7 +9,7 @@ from PIL import Image
 from z3 import Real, Optimize, If, Or, sat
 
 ##############################################################################
-# 1) Parse dtype
+# 1) Parse dtype (posit8 or float32)
 ##############################################################################
 if len(sys.argv) > 1:
     data_t = sys.argv[1]
@@ -238,46 +238,71 @@ if res == sat:
     print("Minimal L1 shift =>", opt.lower(h))
 
     model = opt.model()
-    cval  = model[cost]
-    print("Cost in model =>", cval)
+    cost_val = model[cost]
+    print("Cost in model =>", cost_val)
 
+    ##########################################################################
     # Freed Weights That Actually Changed
+    ##########################################################################
     threshold = 1e-9
     print("\n*** Freed Final Weights That Changed ***")
     changed_any = False
 
-    # Helper to parse z3 rationals or decimals
     def z3_numeral_to_float(z3val):
-        # Convert a z3 numeral to float even if it's fraction or has '?'
         val_str = str(z3val)
         if '/' in val_str:
-            # fraction form => parse
+            # fraction form
             num, den = val_str.split('/')
             return float(num)/float(den)
         else:
-            # try as_decimal approach
+            # try as_decimal
             try:
                 dec_str = str(z3val.as_decimal(50))
-                # remove trailing '?'
                 if '?' in dec_str:
                     dec_str = dec_str[: dec_str.index('?')]
                 return float(dec_str)
             except:
-                # fallback direct
                 return float(val_str)
 
     for i in range(84):
         for o in range(10):
-            w_new = model[ FreedW[(i,o)] ]
-            w_orig= fc3_w_orig[i,o]
+            w_new_z3 = model[FreedW[(i,o)]]
+            w_orig   = fc3_w_orig[i,o]
 
-            w_new_float = z3_numeral_to_float(w_new)
+            w_new_float = z3_numeral_to_float(w_new_z3)
             delta = w_new_float - w_orig
             if abs(delta) > threshold:
                 changed_any = True
                 print(f"fc3W_{i}_{o}: orig={w_orig:.6f}, new={w_new_float:.6f}, shift={delta:.6f}")
-
     if not changed_any:
         print("No final W changed by more than threshold.")
+
+    ##########################################################################
+    # 8) Post-solution check => see new classification
+    ##########################################################################
+    # Rebuild final-layer W with the found solution
+    fc3W_modified = np.array(fc3_w_orig, copy=True)
+    for i in range(84):
+        for o in range(10):
+            w_new_z3 = model[ FreedW[(i,o)] ]
+            w_new_float = z3_numeral_to_float(w_new_z3)
+            fc3W_modified[i,o] = w_new_float
+
+    fc3b_modified = fc3_b_orig  # pinned
+
+    # new final pass => 10 logits
+    new_logits = np.dot(fc2_out, fc3W_modified) + fc3b_modified
+    print("\nNew final logits after SHIFT in final-layer weights =>", new_logits)
+    new_pred = np.argmax(new_logits)
+    print(f"Argmax => digit={new_pred}. (Originally was 1 => misclassification if new_pred != 1)")
+
+    # Also see which digits > final_out(1)
+    final_1_val = new_logits[1]
+    bigger_digits = []
+    for d in range(10):
+        if d != 1 and new_logits[d] > final_1_val:
+            bigger_digits.append(d)
+    print(f"final_out(1) = {final_1_val:.6f}, digits with logit> final_out(1): {bigger_digits}")
+
 else:
     print("Result:", res)
