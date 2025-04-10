@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-VERIFY_PATCH_ULTRATINY_WITH_FORWARD_9_OPTIMIZE_MINIMAL_SAVE.PY
+VERIFY_PATCH_ULTRATINY_WITH_FORWARD_9_BEFORE_AFTER.PY
 
 1) Loads a tf.posit16 ultra-tiny MLP from 'posit16_ultratinymlp.ckpt'.
-2) Picks digit=9 from MNIST test set, does forward pass => label=9.
-3) Defines a large bottom patch => rows=20..27, cols=0..27, ±0.1
-   BUT uses Z3.Optimize to minimize sum(|x_new - x_orig|) in that region.
-   So the solver changes only the needed subset of that big patch.
-4) If sat => prints minimal cost + *also saves a color-coded image* 
-   showing which pixels changed.
+2) Picks digit=9 from MNIST test set, prints ASCII of original + classification.
+3) Defines a bottom patch => rows=20..27, cols=0..27 => ±0.1,
+   uses Z3.Optimize to minimize sum(|x_new - x_orig|).
+4) If sat => build adv image => print ASCII of adv => re-feed to MLP => new classification.
+
+Hence you get:
+ - original ASCII + class
+ - post-attack ASCII + new class
 
 Author: ChatGPT
 """
@@ -19,16 +21,10 @@ import tensorflow as tf
 from z3 import Optimize, Real, Bool, Or, And, Implies, Not, sat
 
 import matplotlib
-matplotlib.use("Agg")  # so we can save without needing a GUI
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-###############################################################################
-# 1) Helper: Convert Z3 value -> float
-###############################################################################
 def z3_value_to_float(z3_val):
-    """
-    If Z3 returns '3/2' => 1.5, or '1.234?' => 1.234
-    """
     val_str = str(z3_val)
     if '/' in val_str:
         num, den = val_str.split('/')
@@ -38,12 +34,53 @@ def z3_value_to_float(z3_val):
             val_str = val_str.split('?')[0]
         return float(val_str)
 
+def ascii_digit(img_28):
+    """
+    ASCII of a 28x28 [-1..1] image with 4 levels
+    """
+    lines = []
+    for r in range(28):
+        row_str = ""
+        for c in range(28):
+            val = img_28[r,c]
+            if val < -0.5:
+                row_str += '.'
+            elif val < 0:
+                row_str += ':'
+            elif val < 0.5:
+                row_str += '+'
+            else:
+                row_str += '#'
+        lines.append(row_str)
+    return lines
+
+def ascii_changed_pixels(orig_img, adv_img, diff_thresh=1e-5):
+    """
+    Mark 'X' if changed, else 3-level brightness of adv pixel
+    """
+    lines = []
+    for r in range(28):
+        row_str = ""
+        for c in range(28):
+            diff = abs(adv_img[r,c] - orig_img[r,c])
+            if diff > diff_thresh:
+                row_str += 'X'
+            else:
+                val = adv_img[r,c]
+                if val < -0.5:
+                    row_str += '.'
+                elif val < 0:
+                    row_str += ':'
+                elif val < 0.5:
+                    row_str += '+'
+                else:
+                    row_str += '#'
+        lines.append(row_str)
+    return lines
+
 
 def main():
-    ############################################################################
-    # A) Parse command line => "posit16"
-    ############################################################################
-    if len(sys.argv) > 1:
+    if len(sys.argv)>1:
         data_t = sys.argv[1]
     else:
         data_t = "float32"
@@ -53,18 +90,13 @@ def main():
     CKPT_PATH = os.path.join(".", CKPT_NAME)
     print("Checkpoint path:", CKPT_PATH)
 
-    ############################################################################
-    # B) Build a graph => ultra-tiny MLP in tf.posit16
-    ############################################################################
     tf.reset_default_graph()
-
     x_ph = tf.placeholder(tf.posit16, shape=(None,28,28,1), name="x_ph")
 
     def flatten_28x28(x):
         return tf.reshape(x, [-1,784])
 
     def ultra_tiny_net(x):
-        # variable names must match your checkpoint's (Variable, Variable_1, etc.)
         W1 = tf.get_variable("Variable",   shape=[784,8], dtype=tf.posit16)
         b1 = tf.get_variable("Variable_1", shape=[8],     dtype=tf.posit16)
         lin1= tf.matmul(flatten_28x28(x), W1) + b1
@@ -79,88 +111,78 @@ def main():
     logits_float = tf.cast(logits_tf, tf.float32)
     pred_tf = tf.argmax(logits_float, axis=1, output_type=tf.int32)
 
-    # gather main variables ignoring Adam
     main_vars = {}
     for v in tf.global_variables():
         nm = v.name.split(":")[0]
         if nm in ["Variable","Variable_1","Variable_2","Variable_3"]:
             main_vars[nm] = v
-
     saver = tf.train.Saver(var_list=main_vars)
 
-    ############################################################################
-    # C) Load MNIST => pick digit=9
-    ############################################################################
+    # Load MNIST => pick digit=9
     (X_train,y_train),(X_test,y_test) = tf.keras.datasets.mnist.load_data()
     idx_9 = None
     for i,lab in enumerate(y_test):
-        if lab == 9:
+        if lab==9:
             idx_9 = i
             break
     if idx_9 is None:
-        print("No digit=9 in test set!")
+        print("No digit=9 found.")
         return
 
     print("Test image => idx=", idx_9, " label=", y_test[idx_9])
-
     orig_img_28 = X_test[idx_9].astype(np.float32)
-    # normalize to [-1..1]
     orig_img_28 = (orig_img_28 - 127.5)/127.5
     test_img = orig_img_28[None,:,:,None]
 
-    ############################################################################
-    # D) TF session => restore => forward pass => read var
-    ############################################################################
+    # Session => original classification
     with tf.Session() as sess:
         sess.run(tf.global_variables_initializer())
         saver.restore(sess, CKPT_PATH)
+        orig_logits, orig_pred = sess.run([logits_float, pred_tf],
+                                          feed_dict={x_ph: test_img})
 
-        out_logits, out_pred = sess.run([logits_float, pred_tf],
-                                        feed_dict={x_ph: test_img})
-        print("Forward pass logits:", out_logits)
-        print("Predicted label =>", out_pred[0])
-
+        # also store W1_val, b1_val, W2_val, b2_val
         W1_val = sess.run(var_tuple[0])
         b1_val = sess.run(var_tuple[1])
         W2_val = sess.run(var_tuple[2])
         b2_val = sess.run(var_tuple[3])
 
-    ############################################################################
-    # E) Build Z3.Optimize => entire bottom band [20..27,0..27], eps=0.1
-    #    then define cost = sum(|x_new - orig|) in that region
-    #    classification => logit(k)>logit(9) for some k!=9
-    ############################################################################
-    from z3 import Optimize, Real, Bool, Or, And, Implies, Not
+    print("Original logits:", orig_logits)
+    print("Original predicted label =>", orig_pred[0])
 
+    # Print ASCII "before"
+    print("\nASCII of original digit=9 image =>\n")
+    before_lines = ascii_digit(orig_img_28)
+    for line in before_lines:
+        print(line)
+
+    # Now do Z3.Optimize => patch => [20..27, 0..27], eps=0.1 => minimal sum of abs diffs
     opt = Optimize()
     x_vars = [ Real(f"x_{i}") for i in range(784) ]
 
-    r0, r1 = 20, 27
-    c0, c1 = 0, 27
+    r0,r1 = 20,27
+    c0,c1 = 0,27
     eps = 0.1
 
     abs_diffs = []
     def flatten_idx(r,c): return r*28 + c
 
+    # build constraints
     for r in range(28):
         for c in range(28):
             idx = flatten_idx(r,c)
-            orig_val = float(orig_img_28[r,c])
-
-            if r0 <= r <= r1 and c0 <= c <= c1:
-                # allow [orig_val-eps, orig_val+eps]
-                opt.add(x_vars[idx] >= orig_val - eps)
-                opt.add(x_vars[idx] <= orig_val + eps)
-                # define absdiff var
+            val_orig = float(orig_img_28[r,c])
+            if r0<=r<=r1 and c0<=c<=c1:
+                opt.add(x_vars[idx] >= val_orig - eps)
+                opt.add(x_vars[idx] <= val_orig + eps)
                 dvar = Real(f"absdiff_{idx}")
-                opt.add(dvar >= x_vars[idx] - orig_val,
-                        dvar >= orig_val - x_vars[idx])
+                opt.add(dvar >= x_vars[idx] - val_orig,
+                        dvar >= val_orig - x_vars[idx])
                 abs_diffs.append(dvar)
             else:
-                # fix outside patch
-                opt.add(x_vars[idx] == orig_val)
+                opt.add(x_vars[idx] == val_orig)
 
-    # hidden => real domain
+    # hidden => 8 reals
     hidden_vars = []
     for i in range(8):
         lin_expr = float(b1_val[i])
@@ -170,11 +192,9 @@ def main():
         # piecewise ReLU
         rb = Bool(f"relu_{i}")
         opt.add((lin_expr >= 0) == rb)
-        opt.add(Implies(rb, hv == lin_expr))
-        opt.add(Implies(Not(rb), hv == 0))
-        opt.add(hv >= 0)
-        opt.add(hv >= lin_expr)
-
+        opt.add(Implies(rb, hv==lin_expr))
+        opt.add(Implies(Not(rb), hv==0))
+        opt.add(hv>=0, hv>=lin_expr)
         hidden_vars.append(hv)
 
     # final => 10 reals
@@ -187,7 +207,7 @@ def main():
         opt.add(lv == val_d)
         logits_vars.append(lv)
 
-    # misclass => ∃ k!=9 => logit[k]>logit(9)
+    # misclass => ∃ k!=9 => logit[k]>logit[9]
     logit9 = logits_vars[9]
     or_list = []
     for k in range(10):
@@ -195,48 +215,42 @@ def main():
             or_list.append(logits_vars[k] > logit9)
     opt.add(Or(or_list))
 
-    # cost => sum(abs_diffs)
     cost = Real("cost")
     opt.add(cost == sum(abs_diffs))
-
     handle = opt.minimize(cost)
 
-    print(f"\nOptimize => searching minimal shift in [20..27,0..27], eps={eps}")
+    print("\nOptimize => searching minimal shift in [20..27,0..27], eps=0.1")
     res = opt.check()
     print("Solver result:", res)
-    if res == sat:
+    if res==sat:
         print("Found minimal adversarial => digit=9 misclassified.")
-        print("Minimal L1 shift =>", opt.lower(handle))
+        min_cost_str = str(opt.lower(handle))
+        print("Minimal L1 shift =>", min_cost_str)
 
         m = opt.model()
         adv_img_28 = np.zeros((28,28), dtype=np.float32)
         for idx in range(784):
             zval = m[x_vars[idx]]
             val_f = z3_value_to_float(zval)
-            rr, cc = divmod(idx, 28)
+            rr, cc = divmod(idx,28)
             adv_img_28[rr,cc] = val_f
 
-        # Now we make a (28,28) "diff_mask" where:
-        # 0 => not changed, 1 => changed by > diff_thresh
-        diff_thresh = 1e-5
-        diff_mask = np.zeros((28,28), dtype=np.float32)
-        for rr in range(28):
-            for cc in range(28):
-                if abs(adv_img_28[rr,cc] - orig_img_28[rr,cc]) > diff_thresh:
-                    diff_mask[rr,cc] = 1.0
+        # "After" ASCII => which pixels changed
+        print("\nASCII of adv image => with X where changed from original:\n")
+        after_lines = ascii_changed_pixels(orig_img_28, adv_img_28, diff_thresh=1e-5)
+        for line in after_lines:
+            print(line)
 
-        # We'll save this diff_mask as a color-coded image
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-
-        plt.figure(figsize=(4,4))
-        plt.imshow(diff_mask, cmap='jet', vmin=0, vmax=1, origin='upper')
-        plt.colorbar(label="changed pixel=1, unchanged=0")
-        plt.title("Changed Pixels in Minimal Adversarial")
-        outfile = "adv_diff.png"
-        plt.savefig(outfile, dpi=100, bbox_inches='tight')
-        print(f"Saved changed-pixel mask to '{outfile}'")
+        # Also classify adv_img => new label
+        adv_batch = adv_img_28[None,:,:,None]  # shape(1,28,28,1), float32
+        # we re-run in a tf session
+        with tf.Session() as sess2:
+            sess2.run(tf.global_variables_initializer())
+            saver.restore(sess2, CKPT_PATH)
+            adv_logits, adv_pred = sess2.run([logits_float, pred_tf],
+                                             feed_dict={x_ph: adv_batch})
+        print("\nAdversarial forward pass logits:", adv_logits)
+        print("Adversarial predicted label =>", adv_pred[0])
 
     else:
         print("No solution =>", res)
