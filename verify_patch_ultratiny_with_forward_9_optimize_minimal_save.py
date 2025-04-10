@@ -12,7 +12,7 @@ Hence you get:
  - original ASCII + class
  - post-attack ASCII + new class
 
-Author: ChatGPT
+Author: Suleiman Sadiq
 """
 
 import sys, os
